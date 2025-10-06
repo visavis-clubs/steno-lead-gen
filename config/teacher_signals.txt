@@ -1,0 +1,67 @@
+# Teacher/authority markers
+framework
+method
+methodology
+system
+blueprint
+playbook
+roadmap
+curriculum
+signature method
+
+# Offer/monetization markers
+coaching
+coach
+mentorship
+consulting
+program
+bootcamp
+masterclass
+workshop
+academy
+university
+school
+challenge
+intensive
+certification
+membership
+inner circle
+accelerator
+cohort
+webinar
+
+# CTA markers
+apply
+enroll
+join the waitlist
+book a call
+register
+free training
+free class
+live training
+cart closes
+doors close
+
+# Platform cues
+Kajabi
+Teachable
+Thinkific
+Skool
+Mighty Networks
+Circle
+Podia
+
+# Verticals (mix with above in queries)
+sales
+public speaking
+marketing
+copywriting
+entrepreneurship
+real estate
+fitness
+nutrition
+productivity
+mindset
+life coaching
+career coaching
+leadership
