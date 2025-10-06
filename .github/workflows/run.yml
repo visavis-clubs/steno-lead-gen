@@ -46,4 +46,37 @@ jobs:
           head -n 5 data/leads_raw.csv || true
 
       # --- YouTube CHANNEL hunter (teacher/offer signals) ---
-      - name: R
+      - name: Run YouTube CHANNEL hunter (teacher signals)
+        env:
+          YT_API_KEY: ${{ secrets.YT_API_KEY }}
+        run: |
+          python src/youtube_channels.py
+          echo "----- leads_raw tail after YT channels -----"
+          tail -n 5 data/leads_raw.csv || true
+
+      # --- Enrichment (websites + public emails) ---
+      - name: Enrich leads (websites + emails)
+        env:
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_SECRET: ${{ secrets.REDDIT_SECRET }}
+          REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
+        run: |
+          python src/enrich_contacts.py
+          echo "----- leads_enriched preview -----"
+          head -n 5 data/leads_enriched.csv || true
+
+      # --- Scoring, dedupe, export ---
+      - name: Score, dedupe, and export
+        run: |
+          python src/score_rank.py
+          echo "----- leads_ready preview -----"
+          head -n 5 data/leads_ready.csv || true
+
+      # --- Commit outputs back to repo ---
+      - name: Commit CSV output
+        uses: EndBug/add-and-commit@v9
+        with:
+          add: "data/leads_raw.csv data/leads_enriched.csv data/leads_ready.csv"
+          message: "Daily harvest (Reddit + YouTube) + enrichment + scoring"
+          default_author: github_actions
+          push: true
