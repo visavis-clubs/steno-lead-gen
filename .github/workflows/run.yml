@@ -3,9 +3,8 @@ name: steno-reddit-leads
 on:
   schedule:
     - cron: "0 13 * * *"   # 9:00 AM ET daily
-  workflow_dispatch:        # manual run
+  workflow_dispatch:
 
-# 👇 give the GITHUB_TOKEN permission to push commits
 permissions:
   contents: write
 
@@ -24,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "praw==7.7.1"
+          pip install "praw==7.7.1" beautifulsoup4 requests
 
       - name: Run Reddit harvester
         env:
@@ -33,13 +32,23 @@ jobs:
           REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
         run: |
           python src/reddit_harvest.py
-          ls -la data || true
-          cat data/leads_raw.csv | head -n 5 || true
+          echo "----- leads_raw preview -----"
+          head -n 5 data/leads_raw.csv || true
+
+      - name: Enrich leads (websites + emails)
+        env:
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_SECRET: ${{ secrets.REDDIT_SECRET }}
+          REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
+        run: |
+          python src/enrich_contacts.py
+          echo "----- leads_enriched preview -----"
+          head -n 5 data/leads_enriched.csv || true
 
       - name: Commit CSV output
         uses: EndBug/add-and-commit@v9
         with:
-          add: "data/leads_raw.csv"
-          message: "Daily Reddit lead harvest"
+          add: "data/leads_raw.csv data/leads_enriched.csv"
+          message: "Daily Reddit lead harvest + enrichment"
           default_author: github_actions
           push: true
