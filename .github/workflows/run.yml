@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "praw==7.7.1" beautifulsoup4 requests
+          pip install "praw==7.7.1" beautifulsoup4 requests google-api-python-client
 
       - name: Run Reddit harvester
         env:
@@ -32,7 +32,15 @@ jobs:
           REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
         run: |
           python src/reddit_harvest.py
-          echo "----- leads_raw preview -----"
+          echo "----- leads_raw after Reddit -----"
+          head -n 5 data/leads_raw.csv || true
+
+      - name: Run YouTube harvester
+        env:
+          YT_API_KEY: ${{ secrets.YT_API_KEY }}
+        run: |
+          python src/youtube_harvest.py
+          echo "----- leads_raw after YouTube -----"
           head -n 5 data/leads_raw.csv || true
 
       - name: Enrich leads (websites + emails)
@@ -49,6 +57,6 @@ jobs:
         uses: EndBug/add-and-commit@v9
         with:
           add: "data/leads_raw.csv data/leads_enriched.csv"
-          message: "Daily Reddit lead harvest + enrichment"
+          message: "Daily harvest (Reddit + YouTube) + enrichment"
           default_author: github_actions
           push: true
