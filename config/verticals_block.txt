@@ -1,0 +1,11 @@
+# Verticals we do NOT want
+fitness
+workout
+bodybuilding
+nutrition
+diet
+yoga
+crossfit
+pilates
+keto
+physique
