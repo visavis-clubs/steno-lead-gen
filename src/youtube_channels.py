@@ -1,33 +1,36 @@
 # src/youtube_channels.py
-# Search YouTube CHANNELS (not videos) for “teacher/offer” signals.
-# For each matched channel, collect subs + channel description + average views on last 10 uploads.
-# Append rows to data/leads_raw.csv with the same columns your pipeline expects.
+# Channel-first hunter focused on business/life/sales/ETA. Skips blocklisted niches (e.g., fitness).
+# Filters by: allowlist terms in channel title/description, NO blocklist terms,
+# subs >= MIN_SUBS, avg views on last uploads >= MIN_AVG_VIEWS.
 
-import os, csv, re, math
+import os, csv, re
 from datetime import datetime, timezone
 from googleapiclient.discovery import build
 
 DST = "data/leads_raw.csv"
-LOOKBACK_UPLOADS = 10         # how many recent uploads to gauge average views
-MAX_CHANNELS_PER_QUERY = 15   # per phrase
-MIN_SUBS = 10000              # floor to avoid tiny channels (tune later)
+LOOKBACK_UPLOADS = 10
+MAX_CHANNELS_PER_QUERY = 15
+MIN_SUBS = 20000           # raise/lower to taste
+MIN_AVG_VIEWS = 5000       # helps avoid low-engagement channels
 
-# Load phrases
 def load_lines(path):
     with open(path, encoding="utf-8") as f:
         return [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
 
 TEACHER_SIG = load_lines("config/teacher_signals.txt")
+ALLOW = [t.lower() for t in load_lines("config/verticals_allow.txt")]
+BLOCK = [t.lower() for t in load_lines("config/verticals_block.txt")]
 
-# Build “channel intent” queries by combining verticals with offer/authority words
-VERTICALS = [
-    "sales","public speaking","marketing","copywriting","entrepreneurship",
-    "real estate","fitness","nutrition","productivity","mindset","leadership","life coaching","career coaching"
-]
+# Offer/authority words to combine with allowlist for discovery
 OFFERS = [
-    "coaching","program","bootcamp","masterclass","workshop","academy","mentorship","framework","method","blueprint"
+    "coaching","coach","consulting","mentorship",
+    "program","bootcamp","masterclass","workshop","academy",
+    "framework","method","blueprint","playbook","roadmap","system",
+    "webinar","challenge","cohort","membership"
 ]
-BASE_QUERIES = sorted({f"{v} {o}" for v in VERTICALS for o in OFFERS})
+
+# Build discovery queries like "life coaching program", "sales coaching framework", etc.
+BASE_QUERIES = sorted({f"{v} {o}" for v in ALLOW for o in OFFERS})
 
 YT = build("youtube","v3",developerKey=os.getenv("YT_API_KEY"))
 
@@ -35,8 +38,7 @@ def search_channels(q):
     res = YT.search().list(
         q=q, part="id,snippet", type="channel", maxResults=50, order="relevance"
     ).execute()
-    ch_ids = [it["id"]["channelId"] for it in res.get("items", [])][:MAX_CHANNELS_PER_QUERY]
-    return ch_ids
+    return [it["id"]["channelId"] for it in res.get("items", [])][:MAX_CHANNELS_PER_QUERY]
 
 def get_channel_details(ids):
     if not ids: return []
@@ -63,10 +65,16 @@ def get_video_stats(ids):
         out[it["id"]] = int(it.get("statistics", {}).get("viewCount", "0") or 0)
     return out
 
-def matches_teacher_signals(text):
+def text_has_any(text, terms):
     t = (text or "").lower()
-    # require at least one "offer/CTA/platform/authority" token
-    return any(sig.lower() in t for sig in TEACHER_SIG)
+    return any(term in t for term in terms)
+
+def matched_term(text, terms):
+    t = (text or "").lower()
+    for term in terms:
+        if term in t:
+            return term
+    return ""
 
 def append_rows(rows):
     os.makedirs("data", exist_ok=True)
@@ -86,51 +94,55 @@ seen=set()
 for q in BASE_QUERIES:
     try:
         ch_ids = search_channels(q)
-        details = get_channel_details(ch_ids)
-        for ch in details:
-            cid = ch["id"]
-            if cid in seen: 
-                continue
-            seen.add(cid)
+        for chunk_start in range(0, len(ch_ids), 50):
+            details = get_channel_details(ch_ids[chunk_start:chunk_start+50])
+            for ch in details:
+                cid = ch["id"]
+                if cid in seen: 
+                    continue
+                seen.add(cid)
 
-            sn = ch.get("snippet", {})
-            stats = ch.get("statistics", {})
-            subs = int(stats.get("subscriberCount","0") or 0)
-            desc = sn.get("description","")
-            title = sn.get("title","")
+                sn = ch.get("snippet", {})
+                stats = ch.get("statistics", {})
+                subs = int(stats.get("subscriberCount","0") or 0)
+                title = sn.get("title","")
+                desc = sn.get("description","")
+                text = f"{title}\n{desc}".lower()
 
-            # quick filters
-            if subs < MIN_SUBS:
-                continue
-            if not matches_teacher_signals(desc + " " + title):
-                continue
+                # filters
+                if subs < MIN_SUBS: 
+                    continue
+                if text_has_any(text, BLOCK):
+                    continue
+                if not text_has_any(text, ALLOW):
+                    continue
+                if not text_has_any(text, TEACHER_SIG):  # must look like a teacher/offer channel
+                    continue
 
-            uploads = ch.get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads")
-            vid_ids = get_last_upload_ids(uploads, LOOKBACK_UPLOADS)
-            vstats = get_video_stats(vid_ids)
-            avg_views = int(round(sum(vstats.values())/max(len(vstats),1))) if vstats else 0
+                uploads = ch.get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads")
+                vid_ids = get_last_upload_ids(uploads, LOOKBACK_UPLOADS)
+                vstats = get_video_stats(vid_ids)
+                avg_views = int(round(sum(vstats.values())/max(len(vstats),1))) if vstats else 0
+                if avg_views < MIN_AVG_VIEWS:
+                    continue
 
-            # evidence = the specific phrase that matched (best-effort)
-            ev = ""
-            for sig in TEACHER_SIG:
-                if sig.lower() in (desc + " " + title).lower():
-                    ev = sig
-                    break
+                ev_allow = matched_term(f"{title} {desc}", ALLOW)
+                ev_sig   = matched_term(f"{title} {desc}", TEACHER_SIG)
+                ev = ev_allow or ev_sig
 
-            # Save one row per channel (timestamp now, so freshness can sort)
-            all_rows.append({
-                "platform": "youtube",
-                "subreddit": title,                                # reuse this column for channel title
-                "url": f"https://www.youtube.com/channel/{cid}",
-                "author_handle": title,
-                "title": f"Channel: {title} (avg_views:{avg_views})",
-                "excerpt": desc[:300],
-                "evidence_quote": ev,
-                "score": str(subs),                                # subscribers
-                "created_utc": int(datetime.now(timezone.utc).timestamp()),
-            })
+                all_rows.append({
+                    "platform": "youtube",
+                    "subreddit": title,                                # channel title
+                    "url": f"https://www.youtube.com/channel/{cid}",
+                    "author_handle": title,
+                    "title": f"Channel: {title} (avg_views:{avg_views})",
+                    "excerpt": desc[:300],
+                    "evidence_quote": ev,
+                    "score": str(subs),                                # subscribers
+                    "created_utc": int(datetime.now(timezone.utc).timestamp()),
+                })
     except Exception:
         continue
 
 append_rows(all_rows)
-print(f"Channel rows added: {len(all_rows)} → {DST}")
+print(f"Channel rows added (focused): {len(all_rows)} → {DST}")
