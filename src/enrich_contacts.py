@@ -130,4 +130,101 @@ def reddit_links(permalink):
     try:
         s = reddit.submission(id=sid)
         links=[]
-        if getattr(s,"is_sel_
+        if getattr(s,"is_self",True) is False and s.url:
+            links.append(s.url)
+        links += extract_urls(getattr(s,"selftext",""))
+        return links
+    except Exception:
+        return []
+
+# ---- Read raw rows ----
+if not os.path.exists(RAW_PATH):
+    # produce empty enriched file if nothing to read
+    with open(ENRICHED_PATH,"w",newline="",encoding="utf-8") as f:
+        w=csv.DictWriter(f, fieldnames=[
+            "platform","subreddit","url","author_handle","title","excerpt","evidence_quote",
+            "score","created_utc","website","contact_url","email","company"
+        ])
+        w.writeheader()
+    print("No leads_raw.csv found; wrote empty leads_enriched.csv")
+    raise SystemExit(0)
+
+rows=[]
+with open(RAW_PATH, newline="", encoding="utf-8") as f:
+    for r in csv.DictReader(f): rows.append(r)
+
+out_rows=[]
+for r in rows:
+    website=""; contact_url=""; company=""; best_email=""
+    emails=set()
+    # collect candidate links
+    candidates=[]
+    if (r.get("platform") or "").lower()=="reddit":
+        candidates += reddit_links(r.get("url",""))
+    else:
+        # For YouTube rows we stored channel/video description in 'excerpt'
+        candidates += extract_urls(r.get("excerpt",""))
+
+    # Expand link-in-bio hubs
+    expanded=[]
+    for u in candidates:
+        d = domain(u)
+        if d.endswith(HUB_DOMAINS):
+            expanded += hub_expand(u)
+    candidates += expanded
+
+    # Prefer non-social sites
+    candidates = [u for u in candidates if not any(s in u for s in ["twitter.com","x.com","instagram.com","tiktok.com"])]
+    # keep unique
+    seen=set(); uniq=[]
+    for u in candidates:
+        if u not in seen:
+            uniq.append(u); seen.add(u)
+    candidates = uniq[:5]  # cap per lead
+
+    # Visit candidates
+    for i,link in enumerate(candidates):
+        html = safe_get(link)
+        if not html: continue
+        if not website and domain(link):
+            website = link
+        company = company or page_title(html)
+        emails |= extract_emails(html)
+
+        # If this looks like a hub/landing page to a real site, pull common pages there too
+        if domain(link) not in HUB_DOMAINS:
+            e2, title2, c_url = collect_from_site(link)
+            emails |= e2
+            company = company or title2
+            contact_url = contact_url or c_url
+        time.sleep(0.3)
+
+    # If nothing yet but we have a domain, brute-try common pages on root
+    if not emails and website:
+        e3, t3, c3 = collect_from_site(website)
+        emails |= e3; company = company or t3; contact_url = contact_url or c3
+
+    # Choose best email
+    if emails:
+        best_email = sorted(emails, key=rank_email)[0]
+
+    out = dict(r)
+    out.update({
+        "website": website,
+        "contact_url": contact_url,
+        "email": best_email,
+        "company": company or r.get("subreddit","") or r.get("author_handle",""),
+    })
+    out_rows.append(out)
+
+# ---- write ----
+os.makedirs("data", exist_ok=True)
+with open(ENRICHED_PATH, "w", newline="", encoding="utf-8") as f:
+    fieldnames = [
+        "platform","subreddit","url","author_handle","title","excerpt",
+        "evidence_quote","score","created_utc","website","contact_url","email","company"
+    ]
+    w=csv.DictWriter(f, fieldnames=fieldnames)
+    w.writeheader(); w.writerows(out_rows)
+
+print(f"Enriched {len(out_rows)} rows → {ENRICHED_PATH}")
