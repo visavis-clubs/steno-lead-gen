@@ -25,7 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install "praw==7.7.1" beautifulsoup4 requests google-api-python-client
 
-      # (Optional) keep Reddit; safe to delete if you want zero Reddit
+      # Optional Reddit (safe to remove if you want zero Reddit)
       - name: Run Reddit harvester
         env:
           REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
@@ -35,13 +35,31 @@ jobs:
           python src/reddit_harvest.py
           head -n 5 data/leads_raw.csv || true
 
-      # Channel-first hunter with hard quota limits
+      # High-volume YouTube *video* harvester
+      - name: Run YouTube video harvester (allowlist/offer queries)
+        env:
+          YT_API_KEY: ${{ secrets.YT_API_KEY }}
+          YT_SEARCH_WINDOW_DAYS: "30"
+          YT_MAX_SEARCH_QUERIES: "80"       # 80 searches ≈ 8,000 units
+          YT_MAX_PAGES_PER_QUERY: "1"       # 1 page/query = 50 videos
+          YT_MIN_SUBS: "10000"
+          DEBUG_YT: "0"
+        run: |
+          python src/youtube_harvest.py
+          echo "----- leads_raw after YT videos -----"
+          tail -n 5 data/leads_raw.csv || true
+
+      # Channel hunter (kept; you can disable if not needed)
       - name: Run YouTube CHANNEL hunter (teacher signals)
         env:
           YT_API_KEY: ${{ secrets.YT_API_KEY }}
-          YT_MAX_QUERIES: "20"            # ~2,000 units/day (100 per search)
+          YT_MAX_QUERIES: "20"
+          YT_MIN_SUBS: "20000"
+          YT_MIN_AVG_VIEWS: "5000"
+          DEBUG_YT: "0"
         run: |
           python src/youtube_channels.py
+          echo "----- leads_raw tail after YT channels -----"
           tail -n 5 data/leads_raw.csv || true
 
       - name: Enrich leads (websites + emails)
@@ -62,6 +80,6 @@ jobs:
         uses: EndBug/add-and-commit@v9
         with:
           add: "data/leads_raw.csv data/leads_enriched.csv data/leads_ready.csv"
-          message: "Daily YouTube channel hunt (quota-limited) + enrichment + scoring"
+          message: "YT videos + YT channels + enrichment + scoring"
           default_author: github_actions
           push: true
