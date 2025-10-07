@@ -1,149 +1,133 @@
 # src/enrich_contacts.py
-# Enrich leads (Reddit + YouTube) with website + public emails.
-# - Reddit: load submission, extract any external links, crawl + /contact
-# - YouTube: extract URLs from the description we stored in 'excerpt', crawl + /contact
+# Enrich leads (YouTube + Reddit) with website/contact URLs and public emails.
+# Improvements:
+# - Scans BOTH channel/video descriptions for external links (already in "excerpt")
+# - Follows link-in-bio hubs (linktr.ee, beacons.ai, solo.to, withkoji, carrd.co)
+# - Crawls common pages: /contact, /about, /press, /media, /speaking, /partner(s), /work-with-me, /book, /privacy, /terms
+# - Extracts mailto: and plain emails; ranks best mailbox (speaking/press/partnerships > founder > info/support)
+# - Gentle timeouts; resilient to failures
 
-import os, csv, re, requests
+import os, csv, re, time, requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
 import praw
-from urllib.parse import urljoin
+
+RAW_PATH = "data/leads_raw.csv"
+ENRICHED_PATH = "data/leads_enriched.csv"
 
 EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 URL_RE = re.compile(r"https?://[^\s)\]]+")
+HUB_DOMAINS = ("linktr.ee", "beacons.ai", "solo.to", "withkoji", "koji.to", "carrd.co", "tap.bio", "shor.by")
 
-# Reddit client
+# Reddit client for grabbing full selftext when needed
 reddit = praw.Reddit(
     client_id=os.getenv("REDDIT_CLIENT_ID"),
     client_secret=os.getenv("REDDIT_SECRET"),
     user_agent=os.getenv("REDDIT_USER_AGENT", "steno-leads/1.0"),
 )
 
-def extract_post_id(permalink: str):
-    m = re.search(r"/comments/([a-z0-9]+)/", permalink)
-    return m.group(1) if m else None
+def safe_get(url, timeout=10):
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code < 400:
+            return r.text
+    except Exception:
+        return ""
+    return ""
 
-def find_urls(text: str):
+def extract_urls(text):
     if not text: return []
-    urls = URL_RE.findall(text)
-    urls = [u.rstrip(").,]") for u in urls if "reddit.com" not in u and "redd.it" not in u]
-    # unique order
+    urls = [u.rstrip(").,]") for u in URL_RE.findall(text)]
     seen, out = set(), []
     for u in urls:
         if u not in seen:
             out.append(u); seen.add(u)
     return out
 
-def fetch_page(url: str):
-    try:
-        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        soup = BeautifulSoup(r.text, "html.parser")
-        title = soup.title.text.strip() if soup.title else ""
-        emails = set(EMAIL_RE.findall(r.text))
-        for a in soup.find_all("a", href=True):
-            if a["href"].lower().startswith("mailto:"):
-                emails.add(a["href"][7:])
-        return title, sorted(emails)
-    except Exception:
-        return "", []
+def extract_emails(html):
+    if not html: return set()
+    emails = set(EMAIL_RE.findall(html))
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.find_all("a", href=True):
+        if a["href"].lower().startswith("mailto:"):
+            emails.add(a["href"][7:])
+    return set(e.strip() for e in emails if not e.lower().endswith("@example.com"))
 
-def try_contact_page(base_url: str):
+def page_title(html):
     try:
-        contact_url = urljoin(base_url if base_url.endswith("/") else base_url + "/", "contact")
-        r = requests.get(contact_url, timeout=10, headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code < 400:
-            emails = set(EMAIL_RE.findall(r.text))
-            return contact_url, sorted(emails)
+        soup = BeautifulSoup(html, "html.parser")
+        if soup.title and soup.title.text:
+            return soup.title.text.strip()[:200]
     except Exception:
         pass
-    return "", []
+    return ""
 
-raw_path = "data/leads_raw.csv"
-enriched_path = "data/leads_enriched.csv"
-os.makedirs("data", exist_ok=True)
+def add_trailing_slash(u):  # help urljoin behave
+    return u if u.endswith("/") else u + "/"
 
-if not os.path.exists(raw_path):
-    with open(enriched_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=[
-            "platform","subreddit","url","author_handle","title","excerpt",
-            "evidence_quote","score","created_utc","website","contact_url","email","company"
-        ])
-        w.writeheader()
-    print("No leads_raw.csv found; wrote empty leads_enriched.csv")
-    raise SystemExit(0)
+COMMON_PATHS = [
+    "contact","contact-us","about","about-us","press","media","speaking","speaker","partners","partnerships",
+    "work-with-me","workwithme","book","booking","sponsor","sponsorship","privacy","privacy-policy","terms","support","help"
+]
 
-rows = []
-with open(raw_path, newline="", encoding="utf-8") as f:
-    reader = csv.DictReader(f)
-    for r in reader:
-        rows.append(r)
+PREFER_ORDER = [
+    "speaking","press","media","partnership","sponsor","booking",
+    "ceo","founder","hello","team","contact","info","support"
+]
 
-out_rows = []
-for r in rows:
-    website = ""
-    contact_url = ""
-    email_list = []
-    company = ""
+def rank_email(em):
+    e = em.lower()
+    for i,kw in enumerate(PREFER_ORDER):
+        if kw in e.split("@")[0]:
+            return i  # lower is better
+    return len(PREFER_ORDER) + (0 if not e.endswith("@gmail.com") else 1)
 
-    links = []
+def hub_expand(url):
+    """Fetch a link-in-bio page and return any outbound links it lists."""
+    html = safe_get(url)
+    if not html: return []
+    soup = BeautifulSoup(html, "html.parser")
+    links=[]
+    for a in soup.find_all("a", href=True):
+        href=a["href"]
+        if href.startswith("mailto:"): continue
+        if href.startswith("#"): continue
+        if "reddit.com" in href: continue
+        links.append(href)
+    return links[:10]  # cap
 
-    if r.get("platform") == "reddit":
-        # Load full Reddit submission to find outbound links
-        post_id = extract_post_id(r.get("url",""))
-        try:
-            if post_id:
-                subm = reddit.submission(id=post_id)
-                if getattr(subm, "is_self", True) is False and subm.url:
-                    links.append(subm.url)
-                links.extend(find_urls(getattr(subm, "selftext", "")))
-        except Exception:
-            pass
-    else:
-        # Non-Reddit (e.g., YouTube): scan the 'excerpt' (we stored video description there)
-        links.extend(find_urls(r.get("excerpt","")))
+def guess_candidate_pages(base_url):
+    base = add_trailing_slash(base_url)
+    return [urljoin(base, p) for p in COMMON_PATHS]
 
-    # clean + cap
-    seen = set(); cleaned = []
-    for u in links:
-        if "reddit.com" in u or "redd.it" in u:
-            continue
-        if u not in seen:
-            cleaned.append(u); seen.add(u)
-    links = cleaned[:2]
+def domain(url):
+    try:
+        n = urlparse(url).netloc.lower()
+        return n[4:] if n.startswith("www.") else n
+    except Exception:
+        return ""
 
-    # Visit up to 2 links
-    for idx, link in enumerate(links):
-        title, emails = fetch_page(link)
-        if title and not company:
-            company = title[:200]
-        if emails:
-            email_list.extend(emails)
-        if not website:
-            website = link
-        if idx == 0:
-            c_url, c_emails = try_contact_page(link)
-            if c_url:
-                contact_url = c_url
-            if c_emails:
-                email_list.extend(c_emails)
+def collect_from_site(site_url):
+    """Visit homepage + common pages, return (emails, best_title, contact_url_if_any)"""
+    emails=set(); title=""; contact_url=""
+    html = safe_get(site_url)
+    if html:
+        title = page_title(html) or title
+        emails |= extract_emails(html)
+    for p in guess_candidate_pages(site_url):
+        h = safe_get(p)
+        if not h: continue
+        emails |= extract_emails(h)
+        if not contact_url and ("contact" in p or "speaking" in p or "press" in p) and EMAIL_RE.search(h):
+            contact_url = p
+        time.sleep(0.3)  # be polite
+    return emails, title, contact_url
 
-    email_list = sorted(set(email_list))
-
-    out = dict(r)
-    out.update({
-        "website": website,
-        "contact_url": contact_url,
-        "email": ";".join(email_list[:3]),
-        "company": company,
-    })
-    out_rows.append(out)
-
-with open(enriched_path, "w", newline="", encoding="utf-8") as f:
-    fieldnames = [
-        "platform","subreddit","url","author_handle","title","excerpt",
-        "evidence_quote","score","created_utc","website","contact_url","email","company"
-    ]
-    w = csv.DictWriter(f, fieldnames=fieldnames)
-    w.writeheader()
-    w.writerows(out_rows)
-
-print(f"Enriched {len(out_rows)} rows → {enriched_path}")
+def reddit_links(permalink):
+    m = re.search(r"/comments/([a-z0-9]+)/", permalink)
+    if not m: return []
+    sid = m.group(1)
+    try:
+        s = reddit.submission(id=sid)
+        links=[]
+        if getattr(s,"is_sel_
